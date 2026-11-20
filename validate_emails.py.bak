@@ -1,0 +1,181 @@
+"""
+Bulk email validator using a local Reacher (check-if-email-exists) container.
+
+Usage:
+    python validate_emails.py emails.csv
+    python validate_emails.py emails.csv --workers 3 --delay 2
+
+Input:  CSV exported from Google Sheets (File > Download > Comma Separated Values).
+        Uses the column whose header contains "email", otherwise the first column.
+Output: (in ./output/)
+    clean.csv    - safe addresses, ready to use
+    risky.csv    - catch-all / disposable / role / full inbox (your call)
+    invalid.csv  - bad addresses, discard
+    unknown.csv  - could not be determined (retry later or from another IP)
+    all_results.csv - everything with details
+
+Progress is cached in cache.jsonl, so you can stop and re-run safely.
+"""
+import argparse
+import csv
+import json
+import re
+import threading
+import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+API = "http://localhost:8080/v0/check_email"
+CACHE = Path("cache.jsonl")
+OUT = Path("output")
+SYNTAX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+cache_lock = threading.Lock()
+rate_lock = threading.Lock()
+next_allowed = {}  # domain -> earliest time of next request
+
+
+def load_emails(path):
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        raise SystemExit("The CSV is empty.")
+    header = rows[0]
+    col = next((i for i, h in enumerate(header) if "email" in h.strip().lower()), None)
+    if col is None:
+        raise SystemExit("No column with 'email' in its header. Rename the header to 'Email'.")
+    by_email = {}  # email -> full original row (first occurrence wins)
+    for r in rows[1:]:
+        if len(r) > col:
+            e = r[col].strip().lower()
+            if e and e not in by_email:
+                by_email[e] = r + [""] * (len(header) - len(r))
+    return header, by_email
+
+
+def load_cache():
+    done = {}
+    if CACHE.exists():
+        for line in CACHE.read_text(encoding="utf-8").splitlines():
+            try:
+                d = json.loads(line)
+                if d["status"] != "unknown":  # retry unknowns on each run
+                    done[d["email"]] = d
+            except Exception:
+                pass
+    return done
+
+
+def throttle(domain, delay):
+    with rate_lock:
+        now = time.time()
+        slot = max(now, next_allowed.get(domain, 0))
+        next_allowed[domain] = slot + delay
+    wait = slot - now
+    if wait > 0:
+        time.sleep(wait)
+
+
+def call_api(email):
+    req = urllib.request.Request(
+        API,
+        data=json.dumps({"to_email": email}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.load(resp)
+
+
+def check(email, delay, retries=2):
+    record = {"email": email, "status": "invalid", "reason": "bad syntax"}
+    if not SYNTAX.match(email):
+        return record
+    domain = email.split("@")[1]
+    for attempt in range(retries + 1):
+        throttle(domain, delay)
+        try:
+            r = call_api(email)
+            smtp, misc, mx = r.get("smtp", {}), r.get("misc", {}), r.get("mx", {})
+            record = {
+                "email": email,
+                "status": r.get("is_reachable", "unknown"),
+                "is_deliverable": smtp.get("is_deliverable"),
+                "is_catch_all": smtp.get("is_catch_all"),
+                "has_full_inbox": smtp.get("has_full_inbox"),
+                "is_disabled": smtp.get("is_disabled"),
+                "can_connect_smtp": smtp.get("can_connect_smtp"),
+                "is_disposable": misc.get("is_disposable"),
+                "is_role_account": misc.get("is_role_account"),
+                "accepts_mail": mx.get("accepts_mail"),
+                "reason": "",
+            }
+            if record["status"] != "unknown":
+                return record
+        except Exception as e:
+            record = {"email": email, "status": "unknown", "reason": f"error: {e}"}
+        time.sleep(3 * (attempt + 1))  # backoff before retry
+    return record
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input")
+    ap.add_argument("--workers", type=int, default=3)
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="min seconds between requests to the same domain")
+    args = ap.parse_args()
+
+    header, by_email = load_emails(args.input)
+    emails = list(by_email)
+    done = load_cache()
+    todo = [e for e in emails if e not in done]
+    print(f"{len(emails)} unique emails, {len(done)} cached, {len(todo)} to check")
+
+    results = dict(done)
+    counter = {"n": 0}
+
+    def work(e):
+        rec = check(e, args.delay)
+        with cache_lock:
+            with CACHE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+            results[e] = rec
+            counter["n"] += 1
+            print(f"[{counter['n']}/{len(todo)}] {e} -> {rec['status']}")
+
+    try:
+        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+            list(ex.map(work, todo))
+    except KeyboardInterrupt:
+        print("\nStopped. Progress saved; re-run to continue.")
+
+    OUT.mkdir(exist_ok=True)
+    buckets = {"safe": [], "risky": [], "invalid": [], "unknown": []}
+    for e in emails:
+        rec = results.get(e)
+        if rec:
+            buckets.setdefault(rec["status"], []).append(rec)
+
+    for name, fname in [("safe", "clean"), ("risky", "risky"),
+                        ("invalid", "invalid"), ("unknown", "unknown")]:
+        with open(OUT / f"{fname}.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(header + ["Validation"])
+            w.writerows([by_email[r["email"]] + [name] for r in buckets[name]])
+
+    fields = ["email", "status", "is_deliverable", "is_catch_all", "has_full_inbox",
+              "is_disabled", "can_connect_smtp", "is_disposable", "is_role_account",
+              "accepts_mail", "reason"]
+    with open(OUT / "all_results.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for e in emails:
+            if e in results:
+                w.writerow(results[e])
+
+    print("\nDone:", {k: len(v) for k, v in buckets.items()}, "-> see ./output/")
+
+
+if __name__ == "__main__":
+    main()
